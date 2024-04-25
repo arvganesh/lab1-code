@@ -2,8 +2,9 @@
 #include <stdlib.h>
 #include <sys/resource.h>
 #include <unistd.h>
+#include <stats.h>
 
-void print_resource_usage() {
+struct rusage print_resource_usage() {
     struct rusage usage;
 
     // Get resource usage statistics
@@ -22,6 +23,8 @@ void print_resource_usage() {
     printf("outblock: %ld\n", usage.ru_oublock);
     printf("nvcsw: %ld\n", usage.ru_nvcsw);
     printf("nivcsw: %ld\n", usage.ru_nivcsw);
+
+    return rusage;
 }
 
 int main() {
