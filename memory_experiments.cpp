@@ -4,19 +4,39 @@
 #include <sys/resource.h>
 #include <unistd.h>
 #include <string>
+#include <string.h>
+#include <assert.h>
 #include <sched.h>
-#include <stats.h>
+#include <unordered_map>
 #include <linux/perf_event.h>
 #include <linux/hw_breakpoint.h> /* Definition of HW_* constants */
 #include <sys/syscall.h>         /* Definition of SYS_* constants */
+#include <sys/ioctl.h>
+#include "stats.h"
 
 #define CACHE_LINE_SIZE 64
+#define CHECK_ERR(call, name) \
+   if (call == -1) { \
+      perror(name); \
+      exit(-1); \
+   }
+
+struct read_format {
+  uint64_t nr;
+  struct {
+    uint64_t value;
+    uint64_t id;
+  } values[];
+};
+
+typedef std::unordered_map<std::string, double> exp_results;
+typedef std::unordered_map<std::string, Stats> stat_storage;
 
 double timevalToDouble(const timeval& t) {
     return static_cast<double>(t.tv_sec) + static_cast<double>(t.tv_usec) / 1000000.0;
 }
 
-std::vector<double> get_resource_usage() {
+void get_resource_usage(exp_results& results) {
     struct rusage usage;
 
     // Get resource usage statistics
@@ -36,20 +56,16 @@ std::vector<double> get_resource_usage() {
     printf("nvcsw: %ld\n", usage.ru_nvcsw);
     printf("nivcsw: %ld\n", usage.ru_nivcsw);
 
-   // Pack into results vector.
-   std::vector<double> results = {
-      timevalToDouble(usage.ru_utime),
-      timevalToDouble(usage.ru_stime),
-      (double) usage.ru_maxrss,
-      (double) usage.ru_minflt,
-      (double) usage.ru_majflt,
-      (double) usage.ru_inblock,
-      (double) usage.ru_oublock,
-      (double) usage.ru_nvcsw,
-      (double) usage.ru_nivcsw
-   };
-
-   return results;
+   // Store results.
+   results["user_time"] = timevalToDouble(usage.ru_utime);
+   results["system_time"] = timevalToDouble(usage.ru_stime);
+   results["max_resident_set_size"] = static_cast<double>(usage.ru_maxrss);
+   results["page_faults_minor"] = static_cast<double>(usage.ru_minflt);
+   results["page_faults_major"] = static_cast<double>(usage.ru_majflt);
+   results["block_input_ops"] = static_cast<double>(usage.ru_inblock);
+   results["block_output_ops"] = static_cast<double>(usage.ru_oublock);
+   results["voluntary_context_switches"] = static_cast<double>(usage.ru_nvcsw);
+   results["involuntary_context_switches"] = static_cast<double>(usage.ru_nivcsw);
 }
 
 long x = 1, y = 4, z = 7, w = 13;
@@ -67,6 +83,9 @@ long simplerand(void) {
 
 // p points to a region that is 1GB (ideally)
 int opt_random_access = 0;
+
+typedef void (*mem_access_function)(char*, int);
+
 void do_mem_access(char* p, int size) {
    int i, j, count, outer, locality;
    int ws_base = 0;
@@ -107,61 +126,152 @@ void clearCache() {
    }
 }
 
-#define SET_CONFIG(attr, cache_id, cache_op_id, cache_op_result_id) attr.config = (cache_id) | \
+#define SET_CONFIG(attr, cache_id, cache_op_id, cache_op_result_id) attr->config = (cache_id) | \
                                (cache_op_id << 8) | \
                                (cache_op_result_id << 16);
-
-void startPerf() {
+int setup_L1D(struct perf_event_attr* attr, int* l1d_read_access_id, int* l1d_read_miss_id, int* l1d_write_access_id) {
    int fd, retval;
    int pid = 0; // measure calling process
    int cpu = -1; // run on any cpu
    int flags = 0;
 
-   struct perf_event_attr attr = {
-      .type = PERF_TYPE_HW_CACHE,
-      .size = sizeof(struct perf_event_attr),
-      .config = 0
-   };
-
+   // First event group.
    SET_CONFIG(attr, PERF_COUNT_HW_CACHE_L1D, PERF_COUNT_HW_CACHE_OP_READ, PERF_COUNT_HW_CACHE_RESULT_ACCESS);
+   attr->disabled = 1;
    fd = syscall(SYS_perf_event_open, &attr, pid, cpu, -1, flags);
    if (fd == -1) {
       perror("startPerf");
       exit(-1);
    }
+   std::cout << "first\n";
+   CHECK_ERR(ioctl(fd, PERF_EVENT_IOC_ID, l1d_read_access_id), "ioctl");
 
-   SET_CONFIG(attr, PERF_COUNT_HW_CACHE_L1D, PERF_COUNT_HW_CACHE_OP_READ, PERF_COUNT_HW_CACHE_RESULT_ACCESS);
+   SET_CONFIG(attr, PERF_COUNT_HW_CACHE_L1D, PERF_COUNT_HW_CACHE_OP_READ, PERF_COUNT_HW_CACHE_RESULT_MISS);
+   attr->disabled = 0;
    retval = syscall(SYS_perf_event_open, &attr, pid, cpu, fd, flags);
    if (retval == -1) {
       perror("startPerf");
       exit(-1);
    }
+   CHECK_ERR(ioctl(fd, PERF_EVENT_IOC_ID, l1d_read_miss_id), "ioctl");
+   std::cout << "second\n";
 
-   SET_CONFIG(attr, PERF_COUNT_HW_CACHE_L1D, PERF_COUNT_HW_CACHE_OP_READ, PERF_COUNT_HW_CACHE_RESULT_ACCESS);
+   SET_CONFIG(attr, PERF_COUNT_HW_CACHE_L1D, PERF_COUNT_HW_CACHE_OP_WRITE, PERF_COUNT_HW_CACHE_RESULT_ACCESS);
+   attr->disabled = 0;
    retval = syscall(SYS_perf_event_open, &attr, pid, cpu, fd, flags);
    if (retval == -1) {
       perror("startPerf");
       exit(-1);
    }
+   CHECK_ERR(ioctl(fd, PERF_EVENT_IOC_ID, l1d_write_access_id), "ioctl");
+   std::cout << "third\n";
 
-   SET_CONFIG(attr, PERF_COUNT_HW_CACHE_L1D, PERF_COUNT_HW_CACHE_OP_READ, PERF_COUNT_HW_CACHE_RESULT_ACCESS);
+   return fd;
+}
+
+int setup_TLB(struct perf_event_attr* attr, int* dtlb_read_miss_id, int* dtlb_write_miss_id) {
+   int fd, retval;
+   int pid = 0; // measure calling process
+   int cpu = -1; // run on any cpu
+   int flags = 0;
+
+   // Second event group.
+   SET_CONFIG(attr, PERF_COUNT_HW_CACHE_DTLB, PERF_COUNT_HW_CACHE_OP_READ, PERF_COUNT_HW_CACHE_RESULT_MISS);
+   attr->disabled = 1;
+   assert(attr->config != 0);
    fd = syscall(SYS_perf_event_open, &attr, pid, cpu, -1, flags);
    if (retval == -1) {
       perror("startPerf");
       exit(-1);
    }
+   CHECK_ERR(ioctl(fd, PERF_EVENT_IOC_ID, dtlb_read_miss_id), "ioctl");
 
-   SET_CONFIG(attr, PERF_COUNT_HW_CACHE_L1D, PERF_COUNT_HW_CACHE_OP_READ, PERF_COUNT_HW_CACHE_RESULT_ACCESS);
+   SET_CONFIG(attr, PERF_COUNT_HW_CACHE_DTLB, PERF_COUNT_HW_CACHE_OP_WRITE, PERF_COUNT_HW_CACHE_RESULT_MISS);
+   attr->disabled = 0;
    retval = syscall(SYS_perf_event_open, &attr, pid, cpu, fd, flags);
    if (retval == -1) {
       perror("startPerf");
       exit(-1);
    }
+   CHECK_ERR(ioctl(fd, PERF_EVENT_IOC_ID, dtlb_write_miss_id), "ioctl");
 
+   return fd;
+}
+
+void recordL1D(exp_results& results, int fd, int read_access_id, int read_miss_id, int write_access_id) {
+   char buffer[4096];
+   CHECK_ERR(read(fd, buffer, sizeof(buffer)), "read");
+   struct read_format* formatted_bytes = (struct read_format*) buffer;
+   for (int i = 0; i < formatted_bytes->nr; ++i) {
+      auto cur = formatted_bytes->values[i];
+      if (cur.id == read_access_id) {
+         results["l1d_read_access"] = cur.value;
+      } else if (cur.id == read_miss_id) {
+         results["l1d_read_miss"] = cur.value;
+      } else if (cur.id == write_access_id) {
+         results["l1d_write_access"] = cur.value;
+      }
+   }
+}
+
+void recordTLB(exp_results& results, int fd, int read_miss_id, int write_miss_id) {
+   char buffer[4096];
+   CHECK_ERR(read(fd, buffer, sizeof(buffer)), "read");
+   struct read_format* formatted_bytes = (struct read_format*) buffer;
+   for (int i = 0; i < formatted_bytes->nr; ++i) {
+      auto cur = formatted_bytes->values[i];
+      if (cur.id == read_miss_id) {
+         results["tlb_read_miss"] = cur.value;
+      } else if (cur.id == write_miss_id) {
+         results["tlb_write_miss"] = cur.value;
+      }
+   }
+}
+
+exp_results runWithPerf(mem_access_function function_to_measure, char* buffer, int size) {
+   // Event IDs.
+   int L1D_read_access_id, L1D_read_miss_id, L1D_write_access_id; 
+   int TLB_read_miss_id, TLB_write_miss_id; 
+
+   struct perf_event_attr attr = {};
+   attr.type = PERF_TYPE_HW_CACHE;
+   attr.size = sizeof(struct perf_event_attr);
+   attr.config = 0;
+   attr.exclude_kernel = 1;
+   attr.exclude_hv = 1;
+   attr.read_format = PERF_FORMAT_GROUP | PERF_FORMAT_ID;
+
+   // Set up perf FDs, they are initially disabled.
+   // Read Event IDs.
+   int L1D_fd = setup_L1D(&attr, &L1D_read_access_id, &L1D_read_miss_id, &L1D_write_access_id);
+   int TLB_fd = setup_TLB(&attr, &TLB_read_miss_id, &TLB_write_miss_id);
+   
+   // Start recording.
+   CHECK_ERR(ioctl(TLB_fd, PERF_EVENT_IOC_RESET, 0), "ioctl");
+   CHECK_ERR(ioctl(L1D_fd, PERF_EVENT_IOC_RESET, 0), "ioctl");
+   CHECK_ERR(ioctl(TLB_fd, PERF_EVENT_IOC_ENABLE, 0), "ioctl");
+   CHECK_ERR(ioctl(L1D_fd, PERF_EVENT_IOC_ENABLE, 0), "ioctl");
+
+   // Run function to measure.
+   function_to_measure(buffer, size);
+
+   // Stop recording.
+   CHECK_ERR(ioctl(TLB_fd, PERF_EVENT_IOC_DISABLE, 0), "ioctl");
+   CHECK_ERR(ioctl(L1D_fd, PERF_EVENT_IOC_DISABLE, 0), "ioctl");
+
+   // Read results.
+   exp_results results;
+   recordL1D(results, L1D_fd, L1D_read_access_id, L1D_read_miss_id, L1D_write_access_id);
+   recordTLB(results, TLB_fd, TLB_read_miss_id, TLB_write_miss_id);
+
+   // Record resource usage.
+   get_resource_usage(results);
+
+   return results;
 }
 
 int use_malloc = 1;
-struct exp_results runExperiment() {
+exp_results runExperiment() {
    clearCache();
 
    char* buffer;
@@ -172,16 +282,27 @@ struct exp_results runExperiment() {
       // use mmap.
    }
 
-   // turn on perf.
-   startPerf();
+   exp_results results = runWithPerf(do_mem_access, buffer, buf_size);
 
-   do_mem_access(buffer, buf_size);
+   return results;
+}
 
-   // turn off perf.
-   // stopPerf();
+void recordTrial(stat_storage& stats, exp_results& trial, bool initialize) {
+   for (const auto& [metric, value] : trial) {
+      if (initialize) {
+         stats[metric] = Stats(metric);
+      }
+      stats[metric].add(value);
+   }
+}
 
-   std::vector<double> rusage_vec = get_resource_usage();
-}  
+void runTrials(int numTrials) {
+   stat_storage stats;
+   for (int i = 0; i < numTrials; ++i) {
+      exp_results trial = runExperiment();
+      recordTrial(stats, trial, i == 0);
+   }
+}
 
 void parseArgs(int argc, char* argv[]) {
    std::vector<std::string> args(argv + 1, argv + argc);

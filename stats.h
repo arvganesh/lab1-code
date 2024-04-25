@@ -1,10 +1,10 @@
-#pragma once
-
 #include <chrono>
 #include <iostream>
 #include <vector>
 #include <string>
 #include <optional>
+#include <cmath>
+#include <algorithm>
 #include <numeric>
 #include <assert.h>
 
@@ -21,7 +21,7 @@ class Stats {
     }
 
 public:
-
+    Stats(): _name("") {}
     Stats(std::string name): _name(name) {}
 
     void add(double x) {
