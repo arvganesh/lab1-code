@@ -16,7 +16,7 @@
 
 #define CACHE_LINE_SIZE 64
 #define CHECK_ERR(call, name) \
-   if (call == -1) { \
+   if ((call) == -1) { \
       perror(name); \
       exit(-1); \
    }
@@ -138,33 +138,30 @@ int setup_L1D(struct perf_event_attr* attr, int* l1d_read_access_id, int* l1d_re
    // First event group.
    SET_CONFIG(attr, PERF_COUNT_HW_CACHE_L1D, PERF_COUNT_HW_CACHE_OP_READ, PERF_COUNT_HW_CACHE_RESULT_ACCESS);
    attr->disabled = 1;
-   fd = syscall(SYS_perf_event_open, &attr, pid, cpu, -1, flags);
+   fd = syscall(SYS_perf_event_open, attr, pid, cpu, -1, flags);
    if (fd == -1) {
       perror("startPerf");
       exit(-1);
    }
-   std::cout << "first\n";
    CHECK_ERR(ioctl(fd, PERF_EVENT_IOC_ID, l1d_read_access_id), "ioctl");
 
    SET_CONFIG(attr, PERF_COUNT_HW_CACHE_L1D, PERF_COUNT_HW_CACHE_OP_READ, PERF_COUNT_HW_CACHE_RESULT_MISS);
    attr->disabled = 0;
-   retval = syscall(SYS_perf_event_open, &attr, pid, cpu, fd, flags);
+   retval = syscall(SYS_perf_event_open, attr, pid, cpu, fd, flags);
    if (retval == -1) {
       perror("startPerf");
       exit(-1);
    }
    CHECK_ERR(ioctl(fd, PERF_EVENT_IOC_ID, l1d_read_miss_id), "ioctl");
-   std::cout << "second\n";
 
    SET_CONFIG(attr, PERF_COUNT_HW_CACHE_L1D, PERF_COUNT_HW_CACHE_OP_WRITE, PERF_COUNT_HW_CACHE_RESULT_ACCESS);
    attr->disabled = 0;
-   retval = syscall(SYS_perf_event_open, &attr, pid, cpu, fd, flags);
+   retval = syscall(SYS_perf_event_open, attr, pid, cpu, fd, flags);
    if (retval == -1) {
       perror("startPerf");
       exit(-1);
    }
    CHECK_ERR(ioctl(fd, PERF_EVENT_IOC_ID, l1d_write_access_id), "ioctl");
-   std::cout << "third\n";
 
    return fd;
 }
@@ -179,7 +176,7 @@ int setup_TLB(struct perf_event_attr* attr, int* dtlb_read_miss_id, int* dtlb_wr
    SET_CONFIG(attr, PERF_COUNT_HW_CACHE_DTLB, PERF_COUNT_HW_CACHE_OP_READ, PERF_COUNT_HW_CACHE_RESULT_MISS);
    attr->disabled = 1;
    assert(attr->config != 0);
-   fd = syscall(SYS_perf_event_open, &attr, pid, cpu, -1, flags);
+   fd = syscall(SYS_perf_event_open, attr, pid, cpu, -1, flags);
    if (retval == -1) {
       perror("startPerf");
       exit(-1);
@@ -188,7 +185,7 @@ int setup_TLB(struct perf_event_attr* attr, int* dtlb_read_miss_id, int* dtlb_wr
 
    SET_CONFIG(attr, PERF_COUNT_HW_CACHE_DTLB, PERF_COUNT_HW_CACHE_OP_WRITE, PERF_COUNT_HW_CACHE_RESULT_MISS);
    attr->disabled = 0;
-   retval = syscall(SYS_perf_event_open, &attr, pid, cpu, fd, flags);
+   retval = syscall(SYS_perf_event_open, attr, pid, cpu, fd, flags);
    if (retval == -1) {
       perror("startPerf");
       exit(-1);
@@ -233,19 +230,20 @@ exp_results runWithPerf(mem_access_function function_to_measure, char* buffer, i
    int L1D_read_access_id, L1D_read_miss_id, L1D_write_access_id; 
    int TLB_read_miss_id, TLB_write_miss_id; 
 
-   struct perf_event_attr attr = {};
+   struct perf_event_attr attr;
+   memset(&attr, 0, sizeof(attr));
    attr.type = PERF_TYPE_HW_CACHE;
-   attr.size = sizeof(struct perf_event_attr);
-   attr.config = 0;
+   attr.size = sizeof(attr);
    attr.exclude_kernel = 1;
    attr.exclude_hv = 1;
-   attr.read_format = PERF_FORMAT_GROUP | PERF_FORMAT_ID;
+   attr.disabled = 1;
+   attr.read_format = (PERF_FORMAT_GROUP | PERF_FORMAT_ID);
 
    // Set up perf FDs, they are initially disabled.
    // Read Event IDs.
-   int L1D_fd = setup_L1D(&attr, &L1D_read_access_id, &L1D_read_miss_id, &L1D_write_access_id);
    int TLB_fd = setup_TLB(&attr, &TLB_read_miss_id, &TLB_write_miss_id);
-   
+   int L1D_fd = setup_L1D(&attr, &L1D_read_access_id, &L1D_read_miss_id, &L1D_write_access_id);
+
    // Start recording.
    CHECK_ERR(ioctl(TLB_fd, PERF_EVENT_IOC_RESET, 0), "ioctl");
    CHECK_ERR(ioctl(L1D_fd, PERF_EVENT_IOC_RESET, 0), "ioctl");
@@ -256,8 +254,8 @@ exp_results runWithPerf(mem_access_function function_to_measure, char* buffer, i
    function_to_measure(buffer, size);
 
    // Stop recording.
-   CHECK_ERR(ioctl(TLB_fd, PERF_EVENT_IOC_DISABLE, 0), "ioctl");
-   CHECK_ERR(ioctl(L1D_fd, PERF_EVENT_IOC_DISABLE, 0), "ioctl");
+   CHECK_ERR(ioctl(L1D_fd, PERF_EVENT_IOC_DISABLE, PERF_IOC_FLAG_GROUP), "ioctl");
+   CHECK_ERR(ioctl(TLB_fd, PERF_EVENT_IOC_DISABLE, PERF_IOC_FLAG_GROUP), "ioctl");
 
    // Read results.
    exp_results results;
@@ -299,6 +297,7 @@ void recordTrial(stat_storage& stats, exp_results& trial, bool initialize) {
 void runTrials(int numTrials) {
    stat_storage stats;
    for (int i = 0; i < numTrials; ++i) {
+      std::cout << "Running Trial " << i << std::endl;
       exp_results trial = runExperiment();
       recordTrial(stats, trial, i == 0);
    }
@@ -330,6 +329,6 @@ void lockToSingleProcessor() {
 int main(int argc, char* argv[]) {
    parseArgs(argc, argv);
    lockToSingleProcessor();
-   runTrials(5);
+   runTrials(1);
    return 0;
 }
