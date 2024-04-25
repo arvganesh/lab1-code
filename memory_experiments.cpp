@@ -8,7 +8,7 @@
 #include <assert.h>
 #include <sched.h>
 #include <fcntl.h>
-#include <unordered_map>
+#include <map>
 #include <linux/perf_event.h>
 #include <linux/hw_breakpoint.h> /* Definition of HW_* constants */
 #include <sys/syscall.h>         /* Definition of SYS_* constants */
@@ -31,13 +31,14 @@ struct read_format {
   } values[];
 };
 
-typedef std::unordered_map<std::string, double> exp_results;
-typedef std::unordered_map<std::string, Stats> stat_storage;
+typedef std::map<std::string, double> exp_results;
+typedef std::map<std::string, Stats> stat_storage;
 
 double timevalToDouble(const timeval& t) {
     return static_cast<double>(t.tv_sec) + static_cast<double>(t.tv_usec) / 1000000.0;
 }
 
+int debug = 0;
 void get_resource_usage(exp_results& results) {
     struct rusage usage;
 
@@ -48,15 +49,17 @@ void get_resource_usage(exp_results& results) {
     }
 
     // Print the desired fields from struct rusage
-    printf("utime: %ld.%06ld seconds\n", usage.ru_utime.tv_sec, usage.ru_utime.tv_usec);
-    printf("stime: %ld.%06ld seconds\n", usage.ru_stime.tv_sec, usage.ru_stime.tv_usec);
-    printf("maxrss (KB): %ld\n", usage.ru_maxrss);
-    printf("minflt: %ld\n", usage.ru_minflt);
-    printf("majflt: %ld\n", usage.ru_majflt);
-    printf("inblock: %ld\n", usage.ru_inblock);
-    printf("outblock: %ld\n", usage.ru_oublock);
-    printf("nvcsw: %ld\n", usage.ru_nvcsw);
-    printf("nivcsw: %ld\n", usage.ru_nivcsw);
+    if (debug) {
+      printf("utime: %ld.%06ld seconds\n", usage.ru_utime.tv_sec, usage.ru_utime.tv_usec);
+      printf("stime: %ld.%06ld seconds\n", usage.ru_stime.tv_sec, usage.ru_stime.tv_usec);
+      printf("maxrss (KB): %ld\n", usage.ru_maxrss);
+      printf("minflt: %ld\n", usage.ru_minflt);
+      printf("majflt: %ld\n", usage.ru_majflt);
+      printf("inblock: %ld\n", usage.ru_inblock);
+      printf("outblock: %ld\n", usage.ru_oublock);
+      printf("nvcsw: %ld\n", usage.ru_nvcsw);
+      printf("nivcsw: %ld\n", usage.ru_nivcsw);
+    }
 
    // Store results.
    results["user_time"] = timevalToDouble(usage.ru_utime);
@@ -154,7 +157,7 @@ int setup_L1D(struct perf_event_attr* attr, int* l1d_read_access_id, int* l1d_re
       perror("startPerf");
       exit(-1);
    }
-   CHECK_ERR(ioctl(fd, PERF_EVENT_IOC_ID, l1d_read_miss_id), "ioctl");
+   CHECK_ERR(ioctl(retval, PERF_EVENT_IOC_ID, l1d_read_miss_id), "ioctl");
 
    SET_CONFIG(attr, PERF_COUNT_HW_CACHE_L1D, PERF_COUNT_HW_CACHE_OP_WRITE, PERF_COUNT_HW_CACHE_RESULT_ACCESS);
    attr->disabled = 0;
@@ -163,7 +166,7 @@ int setup_L1D(struct perf_event_attr* attr, int* l1d_read_access_id, int* l1d_re
       perror("startPerf");
       exit(-1);
    }
-   CHECK_ERR(ioctl(fd, PERF_EVENT_IOC_ID, l1d_write_access_id), "ioctl");
+   CHECK_ERR(ioctl(retval, PERF_EVENT_IOC_ID, l1d_write_access_id), "ioctl");
 
    return fd;
 }
@@ -192,7 +195,9 @@ int setup_TLB(struct perf_event_attr* attr, int* dtlb_read_miss_id, int* dtlb_wr
       perror("startPerf");
       exit(-1);
    }
-   CHECK_ERR(ioctl(fd, PERF_EVENT_IOC_ID, dtlb_write_miss_id), "ioctl");
+   CHECK_ERR(ioctl(retval, PERF_EVENT_IOC_ID, dtlb_write_miss_id), "ioctl");
+
+   std::cout << "tlb read miss id: " << *dtlb_read_miss_id << " tlb write miss id: " << *dtlb_write_miss_id << std::endl;
 
    return fd;
 }
@@ -261,6 +266,7 @@ exp_results runWithPerf(mem_access_function function_to_measure, char* buffer, i
 
    // Read results.
    exp_results results;
+   std::cout << "tlb read miss id: " << TLB_read_miss_id << " tlb write miss id: " << TLB_write_miss_id << std::endl;
    recordL1D(results, L1D_fd, L1D_read_access_id, L1D_read_miss_id, L1D_write_access_id);
    recordTLB(results, TLB_fd, TLB_read_miss_id, TLB_write_miss_id);
 
@@ -275,11 +281,8 @@ int use_map_shared = 0;
 int use_map_populate = 0;
 int use_file_backing = 0;
 int use_msync = 0;
-exp_results runExperiment() {
-   clearCache();
-
+char* allocateBuffer(int buf_size) {
    char* buffer;
-   int buf_size = (1 << 30);
    if (use_malloc) {
       buffer = (char*) malloc(buf_size);
    } else {
@@ -305,8 +308,14 @@ exp_results runExperiment() {
       CHECK_ERR(msync(buffer, buf_size, MS_ASYNC), "msync");
    }
 
-   exp_results results = runWithPerf(do_mem_access, buffer, buf_size);
+   return buffer;
+}
 
+exp_results runExperiment() {
+   clearCache();
+   int buf_size = 1 << 30;
+   char* buffer = allocateBuffer(buf_size);
+   exp_results results = runWithPerf(do_mem_access, buffer, buf_size);
    return results;
 }
 
@@ -319,6 +328,14 @@ void recordTrial(stat_storage& stats, exp_results& trial, bool initialize) {
    }
 }
 
+void summarize(stat_storage stats) {
+   for (const auto& metric_to_stats : stats) {
+      const auto& metric_name = metric_to_stats.first;
+      const auto& data = metric_to_stats.second;
+      std::cout << data << std::endl;
+   }
+}
+
 void runTrials(int numTrials) {
    stat_storage stats;
    for (int i = 0; i < numTrials; ++i) {
@@ -326,7 +343,9 @@ void runTrials(int numTrials) {
       exp_results trial = runExperiment();
       recordTrial(stats, trial, i == 0);
    }
+   summarize(stats);
 }
+
 
 void parseArgs(int argc, char* argv[]) {
    std::vector<std::string> args(argv + 1, argv + argc);
@@ -344,6 +363,8 @@ void parseArgs(int argc, char* argv[]) {
          use_file_backing = 1;
       } else if (*it == "msync") {
          use_msync = 1;
+      } else if (*it == "debug") {
+         debug = 1;
       }
    }
 }
