@@ -7,12 +7,14 @@
 #include <string.h>
 #include <assert.h>
 #include <sched.h>
+#include <fcntl.h>
 #include <unordered_map>
 #include <linux/perf_event.h>
 #include <linux/hw_breakpoint.h> /* Definition of HW_* constants */
 #include <sys/syscall.h>         /* Definition of SYS_* constants */
 #include <sys/ioctl.h>
 #include "stats.h"
+#include <sys/mman.h>
 
 #define CACHE_LINE_SIZE 64
 #define CHECK_ERR(call, name) \
@@ -269,6 +271,10 @@ exp_results runWithPerf(mem_access_function function_to_measure, char* buffer, i
 }
 
 int use_malloc = 1;
+int use_map_shared = 0;
+int use_map_populate = 0;
+int use_file_backing = 0;
+int use_msync = 0;
 exp_results runExperiment() {
    clearCache();
 
@@ -278,6 +284,25 @@ exp_results runExperiment() {
       buffer = (char*) malloc(buf_size);
    } else {
       // use mmap.
+      int prot = PROT_READ | PROT_WRITE;
+      int flags = (use_map_shared ? MAP_SHARED : MAP_PRIVATE) | (use_map_populate ? MAP_POPULATE : 0);
+      int fd = -1;
+      int offset = 0;
+
+      if (use_file_backing) {
+         fd = open("sample.txt", O_RDWR, "rw"); // open 1 GB file.
+         CHECK_ERR(fd, "open");
+      } else {
+         flags |= MAP_ANONYMOUS;
+      }
+      buffer = (char*) mmap(NULL, buf_size, prot, flags, fd, offset);
+   }
+
+   CHECK_ERR((buffer == NULL) ? -1 : 0, "1 GB buffer allocation failed.");
+
+   if (use_msync && use_file_backing) {
+      memset(buffer, 0xFF, buf_size);
+      CHECK_ERR(msync(buffer, buf_size, MS_ASYNC), "msync");
    }
 
    exp_results results = runWithPerf(do_mem_access, buffer, buf_size);
@@ -311,6 +336,14 @@ void parseArgs(int argc, char* argv[]) {
          opt_random_access = 1;
       } else if (*it == "mmap") {
          use_malloc = 0;
+      } else if (*it == "shared") {
+         use_map_shared = 1;
+      } else if (*it == "prefault") {
+         use_map_populate = 1;
+      } else if (*it == "filebacked") {
+         use_file_backing = 1;
+      } else if (*it == "msync") {
+         use_msync = 1;
       }
    }
 }
