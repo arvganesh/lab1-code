@@ -34,10 +34,20 @@ struct read_format {
 
 typedef std::map<std::string, double> exp_results;
 typedef std::map<std::string, Stats> stat_storage;
+typedef void (*mem_access_function)(char*, int);
+
+int GLOBAL_should_fork = 0;
+int GLOBAL_opt_random_access = 0;
+int GLOBAL_use_malloc = 1;
+int GLOBAL_map_shared = 0;
+int GLOBAL_use_map_populate = 0;
+int GLOBAL_use_file_backing = 0;
+int GLOBAL_use_msync = 0;
 
 double timevalToDouble(const timeval& t) {
     return static_cast<double>(t.tv_sec) + static_cast<double>(t.tv_usec) / 1000000.0;
 }
+
 
 int debug = 0;
 void get_resource_usage(exp_results& results) {
@@ -87,11 +97,6 @@ long simplerand(void) {
 	return w;
 }
 
-// p points to a region that is 1GB (ideally)
-int opt_random_access = 0;
-
-typedef void (*mem_access_function)(char*, int);
-
 void do_mem_access(char* p, int size) {
    int i, j, count, outer, locality;
    int ws_base = 0;
@@ -99,7 +104,7 @@ void do_mem_access(char* p, int size) {
 	for(outer = 0; outer < (1<<20); ++outer) {
       long r = simplerand() % max_base;
       // Pick a starting offset
-      if (opt_random_access) {
+      if (GLOBAL_opt_random_access) {
          ws_base = r;
       } else {
          ws_base += 512;
@@ -277,23 +282,18 @@ exp_results runWithPerf(mem_access_function function_to_measure, char* buffer, i
    return results;
 }
 
-int use_malloc = 1;
-int use_map_shared = 0;
-int use_map_populate = 0;
-int use_file_backing = 0;
-int use_msync = 0;
 char* allocateBuffer(int buf_size) {
    char* buffer;
-   if (use_malloc) {
+   if (GLOBAL_use_malloc) {
       buffer = (char*) malloc(buf_size);
    } else {
       // use mmap.
       int prot = PROT_READ | PROT_WRITE;
-      int flags = (use_map_shared ? MAP_SHARED : MAP_PRIVATE) | (use_map_populate ? MAP_POPULATE : 0);
+      int flags = (GLOBAL_map_shared ? MAP_SHARED : MAP_PRIVATE) | (GLOBAL_use_map_populate ? MAP_POPULATE : 0);
       int fd = -1;
       int offset = 0;
 
-      if (use_file_backing) {
+      if (GLOBAL_use_file_backing) {
          fd = open("sample.txt", O_RDWR, "rw"); // open 1 GB file.
          CHECK_ERR(fd, "open");
       } else {
@@ -304,7 +304,7 @@ char* allocateBuffer(int buf_size) {
 
    CHECK_ERR((buffer == NULL) ? -1 : 0, "1 GB buffer allocation failed.");
 
-   if (use_msync && use_file_backing) {
+   if (GLOBAL_use_msync && GLOBAL_use_file_backing) {
       memset(buffer, 0xFF, buf_size);
       CHECK_ERR(msync(buffer, buf_size, MS_ASYNC), "msync");
    }
@@ -352,21 +352,21 @@ void parseArgs(int argc, char* argv[]) {
    std::vector<std::string> args(argv + 1, argv + argc);
    for (auto it = args.begin(); it != args.end(); ++it) {
       if (*it == "random") {
-         opt_random_access = 1;
+         GLOBAL_opt_random_access = 1;
       } else if (*it == "mmap") {
-         use_malloc = 0;
+         GLOBAL_use_malloc = 0;
       } else if (*it == "shared") {
-         use_map_shared = 1;
+         GLOBAL_map_shared = 1;
       } else if (*it == "prefault") {
-         use_map_populate = 1;
+         GLOBAL_use_map_populate = 1;
       } else if (*it == "filebacked") {
-         use_file_backing = 1;
+         GLOBAL_use_file_backing = 1;
       } else if (*it == "msync") {
-         use_msync = 1;
+         GLOBAL_use_msync = 1;
       } else if (*it == "debug") {
          debug = 1;
       }  else if (*it == "fork") {
-         should_fork = 1;
+         GLOBAL_should_fork = 1;
       }
    }
 }
@@ -393,7 +393,7 @@ int compete_for_memory() {
    int page_sz = sysconf(_SC_PAGE_SIZE);
    printf("Total memsize is %3.2f GBs\n", (double)mem_size/(1024*1024*1024));
    fflush(stdout);
-   char* p = mmap(NULL, mem_size, PROT_READ | PROT_WRITE,
+   char* p = (char*) mmap(NULL, mem_size, PROT_READ | PROT_WRITE,
                   MAP_NORESERVE|MAP_PRIVATE|MAP_ANONYMOUS, -1, (off_t) 0);
    if (p == MAP_FAILED)
       perror("Failed anon MMAP competition");
@@ -427,10 +427,9 @@ void handle_fork() {
    }
 }
 
-int should_fork = 0;
 int main(int argc, char* argv[]) {
    parseArgs(argc, argv);
-   if (should_fork) {
+   if (GLOBAL_should_fork) {
       handle_fork();
    }
    lockToSingleProcessor();
